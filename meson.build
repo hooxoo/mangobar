@@ -37,6 +37,12 @@ xdg_output_c = gen_code.process(xdg_output_xml)
 wlr_layer_h = gen_header.process(wlr_layer_xml)
 wlr_layer_c = gen_code.process(wlr_layer_xml)
 
+conf_h = configure_file(
+  input : 'config.def.h',
+  output : 'config.h',
+  copy : true
+)
+
 executable('mangobar',
   sources: [
     xdg_shell_h, xdg_shell_c,
