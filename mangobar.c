@@ -256,19 +256,20 @@ static void draw_bar(Bar *bar) {
 	pixman_image_t *bg = pixman_image_create_bits(
 		PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
 
+	pixman_image_fill_rectangles(
+		PIXMAN_OP_SRC, bg, bar->sel ? &middle_bg_sel : &middle_bg, 1,
+		&(pixman_rectangle16_t){0, 0, bar->width, bar->height});
+
 	uint32_t x = 0;
 	uint32_t y = (bar->height + font->ascent - font->descent) / 2;
 
 	/* --- 1. 左侧模块：标签 --- */
 	if (show_tags) {
 		if (bar->overview_mode) {
-			/* 当 active_tags == [0] 时，只显示 OVERVIEW */
 			x = draw_text("OVERVIEW", x, y, fg, fg_mask, bg, &overview_fg,
 						  &overview_bg, bar->width, bar->height);
 		} else {
 			for (int i = 0; i < TAG_COUNT; i++) {
-				/* 过滤条件：如果配置为只显示占用标签，则跳过既无客户端又不在
-				 * active_tags 中的标签 */
 #if show_only_occupied_tags
 				if (!(bar->ctags & (1 << i)) && !(bar->atags & (1 << i)))
 					continue;
@@ -358,7 +359,7 @@ static void draw_bar(Bar *bar) {
 	if (right_start < x)
 		right_start = x;
 
-	/* 中间背景 */
+	/* 中间背景（会覆盖初始背景的对应区域） */
 	if (right_start > x) {
 		pixman_image_fill_boxes(
 			PIXMAN_OP_SRC, bg, bar->sel ? &middle_bg_sel : &middle_bg, 1,
@@ -389,6 +390,13 @@ static void draw_bar(Bar *bar) {
 		cur_x =
 			draw_text(modules[i].text, cur_x, y, fg, fg_mask, bg, modules[i].fg,
 					  modules[i].bg, bar->width, bar->height);
+	}
+
+	if (cur_x < bar->width) {
+		pixman_image_fill_boxes(
+			PIXMAN_OP_SRC, bg, bar->sel ? &middle_bg_sel : &middle_bg, 1,
+			&(pixman_box32_t){
+				.x1 = cur_x, .x2 = bar->width, .y1 = 0, .y2 = bar->height});
 	}
 
 	/* 合成最终图像 */
