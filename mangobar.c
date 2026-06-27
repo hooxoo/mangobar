@@ -13,6 +13,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -105,11 +106,30 @@ typedef struct {
 	char keymode[32];
 	char kb_layout[16];
 	int cpu_pct, mem_pct;
+	int volume_pct;
+	bool volume_muted;
+	int pacman_updates;
 	char time_str[16];
 	bool redraw;
 	bool overview_mode; // 当 active_tags == [0] 时为 true
 	struct wl_list link;
 } Bar;
+
+/* rename layout name */
+static const char *layout_name(const char *symbol) {
+  if (strcmp(symbol, "T") == 0) return " LAYOUT:TILE";
+  if (strcmp(symbol, "M") == 0) return " LAYOUT:MONOCLE";
+  if (strcmp(symbol, "F") == 0) return " LAYOUT:FAIR";
+  if (strcmp(symbol, "S") == 0) return " LAYOUT:SCROLLER";
+  if (strcmp(symbol, "G") == 0) return " LAYOUT:GRID";
+  if (strcmp(symbol, "CT") == 0) return " LAYOUT:cTILE";
+  if (strcmp(symbol, "VT") == 0) return " LAYOUT:vTILE";
+  if (strcmp(symbol, "VF") == 0) return " LAYOUT:vFAIR";
+  if (strcmp(symbol, "DW") == 0) return " LAYOUT:DWINDLE";
+  if (strcmp(symbol, "VS") == 0) return " LAYOUT:vSCROLLER";
+  if (strcmp(symbol, "VK") == 0) return " LAYOUT:FREE";
+  return symbol;
+}
 
 static struct wl_display *display;
 static struct wl_compositor *compositor;
@@ -123,6 +143,11 @@ static bool running = true;
 static int ipc_fd = -1;
 static char ipc_buf[65536];
 static size_t ipc_buf_len = 0;
+
+static int inotify_fd = -1;
+static bool pkg_dirty = false;
+static time_t pkg_last_check = 0;
+static int pkg_cached = 0;
 
 /* 颜色变量 */
 static pixman_color_t active_fg, active_bg;
@@ -139,6 +164,9 @@ static pixman_color_t mem_fg, mem_bg;
 static pixman_color_t clock_fg, clock_bg;
 static pixman_color_t keymode_fg, keymode_bg;
 static pixman_color_t keyboardlayout_fg, keyboardlayout_bg;
+static pixman_color_t volume_fg, volume_bg;
+static pixman_color_t volume_muted_fg, volume_muted_bg;
+static pixman_color_t pacman_fg, pacman_bg;
 static pixman_color_t overview_fg, overview_bg;
 static pixman_color_t separator_fg, separator_bg;
 
@@ -266,7 +294,7 @@ static void draw_bar(Bar *bar) {
 	/* --- 1. 左侧模块：标签 --- */
 	if (show_tags) {
 		if (bar->overview_mode) {
-			x = draw_text("OVERVIEW", x, y, fg, fg_mask, bg, &overview_fg,
+			x = draw_text("  OVERVIEW  ", x, y, fg, fg_mask, bg, &overview_fg,
 						  &overview_bg, bar->width, bar->height);
 		} else {
 			for (int i = 0; i < TAG_COUNT; i++) {
@@ -291,16 +319,19 @@ static void draw_bar(Bar *bar) {
 					f = &empty_fg;
 					b = &empty_bg;
 				}
-				x = draw_text(tag_names[i], x, y, fg, fg_mask, bg, f, b,
+				const char *tag_text;
+				if (urgent)
+					tag_text = tag_names_urgent[i];
+				else if (active)
+					tag_text = tag_names_active[i];
+				else if (occupied)
+					tag_text = tag_names_occupied[i];
+				else
+					tag_text = tag_names[i];
+				x = draw_text(tag_text, x, y, fg, fg_mask, bg, f, b,
 							  bar->width, bar->height);
 			}
 		}
-	}
-
-	/* 布局模块 */
-	if (show_layout) {
-		x = draw_text(bar->layout, x, y, fg, fg_mask, bg, &layout_fg,
-					  &layout_bg, bar->width, bar->height);
 	}
 
 	/* --- 右侧模块列表构建 --- */
@@ -309,10 +340,10 @@ static void draw_bar(Bar *bar) {
 		pixman_color_t *fg;
 		pixman_color_t *bg;
 		bool enabled;
-	} modules[5];
+	} modules[8];
 	int mod_count = 0;
 
-	char mod_text[5][64];
+	char mod_text[8][64];
 	int idx = 0;
 
 	if (show_keymode) {
@@ -336,6 +367,29 @@ static void draw_bar(Bar *bar) {
 				 bar->mem_pct);
 		modules[idx++] =
 			(typeof(modules[0])){mod_text[idx - 1], &mem_fg, &mem_bg, true};
+	}
+	if (show_layout) {
+		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->layout);
+		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], &layout_fg,
+											  &layout_bg, true};
+	}
+	if (show_volume) {
+		pixman_color_t *vf = &volume_fg, *vb = &volume_bg;
+		if (bar->volume_muted) {
+			snprintf(mod_text[idx], sizeof(mod_text[idx]), "MUTE");
+			vf = &volume_muted_fg;
+			vb = &volume_muted_bg;
+		} else {
+			snprintf(mod_text[idx], sizeof(mod_text[idx]), "VOL:%d",
+					 bar->volume_pct);
+		}
+		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], vf, vb, true};
+	}
+	if (show_pacman) {
+		snprintf(mod_text[idx], sizeof(mod_text[idx]), "UPDATES:%d",
+				 bar->pacman_updates);
+		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], &pacman_fg,
+											  &pacman_bg, true};
 	}
 	if (show_clock) {
 		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->time_str);
@@ -367,12 +421,10 @@ static void draw_bar(Bar *bar) {
 				.x1 = x, .x2 = right_start, .y1 = 0, .y2 = bar->height});
 	}
 
-	/* 标题模块（居中） */
-	if (show_title && bar->title[0] != '\0' && right_start > x) {
+	/* 标题模块（绝对居中） */
+	if (show_title && bar->title[0] != '\0') {
 		uint32_t tw = text_width(bar->title);
-		uint32_t center_x = x + (right_start - x - tw) / 2;
-		if (center_x < x + 8)
-			center_x = x + 8;
+		uint32_t center_x = (bar->width - tw) / 2;
 		draw_text(bar->title, center_x, y, fg, fg_mask, bg, &title_fg,
 				  &title_bg, bar->width, bar->height);
 	}
@@ -530,7 +582,9 @@ static void registry_global(void *data, struct wl_registry *registry,
 										   &layer_surface_listener, bar);
 		zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, bar_height);
 		zwlr_layer_surface_v1_set_anchor(
-			bar->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+			bar->layer_surface, (BAR_POSITION
+									 ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+									 : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) |
 									ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
 									ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
 		zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
@@ -564,7 +618,8 @@ static void update_bar_json(Bar *bar, cJSON *json) {
 	if ((item = cJSON_GetObjectItem(json, "active")))
 		bar->sel = cJSON_IsTrue(item);
 	if ((item = cJSON_GetObjectItem(json, "layout_symbol")))
-		strncpy(bar->layout, item->valuestring, sizeof(bar->layout) - 1);
+		strncpy(bar->layout, layout_name(item->valuestring), sizeof(bar->layout) - 1);
+		// strncpy(bar->layout, item->valuestring, sizeof(bar->layout) - 1);
 
 	cJSON *client = cJSON_GetObjectItem(json, "active_client");
 	if (client && !cJSON_IsNull(client)) {
@@ -754,9 +809,67 @@ static void update_system_info() {
 	time_t now = time(NULL);
 	struct tm *tm = localtime(&now);
 	char ts[16];
-	strftime(ts, sizeof(ts), "%H:%M", tm);
+	strftime(ts, sizeof(ts), "%I:%M%p", tm);
 	Bar *b;
 	wl_list_for_each(b, &bar_list, link) strcpy(b->time_str, ts);
+
+	/* Volume */
+	{
+		int vol = -1;
+		bool muted = false;
+		FILE *fp = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+		if (fp) {
+			char line[256];
+			if (fgets(line, sizeof(line), fp)) {
+				float vol_float;
+				if (sscanf(line, "Volume: %f", &vol_float) == 1)
+					vol = (int)(vol_float * 100 + 0.5f);
+				if (strstr(line, "[MUTED]"))
+					muted = true;
+			}
+			pclose(fp);
+		}
+		if (vol < 0) vol = 0;
+		Bar *b;
+		wl_list_for_each(b, &bar_list, link) {
+			b->volume_pct = vol;
+			b->volume_muted = muted;
+		}
+	}
+
+	/* Updates (check every 3600s, or immediately when pkg_dirty) */
+	{
+		time_t now_sec = time(NULL);
+		if (pkg_dirty || now_sec - pkg_last_check >= 3600) {
+			pkg_dirty = false;
+			pkg_last_check = now_sec;
+
+			int official = 0, aur = 0;
+
+			FILE *fp = popen("checkupdates 2>/dev/null | wc -l", "r");
+			if (fp) {
+				if (fscanf(fp, "%d", &official) != 1) official = 0;
+				pclose(fp);
+			}
+			if (official == 0) {
+				fp = popen("pacman -Qu 2>/dev/null | wc -l", "r");
+				if (fp) {
+					if (fscanf(fp, "%d", &official) != 1) official = 0;
+					pclose(fp);
+				}
+			}
+
+			fp = popen("yay -Qum 2>/dev/null | wc -l", "r");
+			if (fp) {
+				if (fscanf(fp, "%d", &aur) != 1) aur = 0;
+				pclose(fp);
+			}
+
+			pkg_cached = (official > 0 ? official : 0) + (aur > 0 ? aur : 0);
+		}
+		Bar *b;
+		wl_list_for_each(b, &bar_list, link) b->pacman_updates = pkg_cached;
+	}
 }
 
 static void event_loop() {
@@ -767,7 +880,11 @@ static void event_loop() {
 		FD_SET(wl_fd, &rfds);
 		if (ipc_fd >= 0)
 			FD_SET(ipc_fd, &rfds);
-		int maxfd = (ipc_fd > wl_fd) ? ipc_fd : wl_fd;
+		if (inotify_fd >= 0)
+			FD_SET(inotify_fd, &rfds);
+		int maxfd = wl_fd;
+		if (ipc_fd > maxfd) maxfd = ipc_fd;
+		if (inotify_fd > maxfd) maxfd = inotify_fd;
 		struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
 		wl_display_flush(display);
 
@@ -791,6 +908,11 @@ static void event_loop() {
 				ipc_fd = -1;
 				ipc_buf_len = 0;
 			}
+		}
+		if (inotify_fd >= 0 && FD_ISSET(inotify_fd, &rfds)) {
+			char ev_buf[4096];
+			read(inotify_fd, ev_buf, sizeof(ev_buf));
+			pkg_dirty = true;
 		}
 		static time_t last_sec;
 		time_t sec = time(NULL);
@@ -837,6 +959,12 @@ static void init_colors() {
 	hex_to_pixman(keymode_bg_color_hex, &keymode_bg);
 	hex_to_pixman(keyboardlayout_fg_color_hex, &keyboardlayout_fg);
 	hex_to_pixman(keyboardlayout_bg_color_hex, &keyboardlayout_bg);
+	hex_to_pixman(volume_fg_color_hex, &volume_fg);
+	hex_to_pixman(volume_bg_color_hex, &volume_bg);
+	hex_to_pixman(volume_muted_fg_color_hex, &volume_muted_fg);
+	hex_to_pixman(volume_muted_bg_color_hex, &volume_muted_bg);
+	hex_to_pixman(pacman_fg_color_hex, &pacman_fg);
+	hex_to_pixman(pacman_bg_color_hex, &pacman_bg);
 
 	hex_to_pixman(overview_fg_color_hex, &overview_fg);
 	hex_to_pixman(overview_bg_color_hex, &overview_bg);
@@ -889,10 +1017,20 @@ int main() {
 	wl_display_roundtrip(display);
 
 	update_system_info();
+
+	inotify_fd = inotify_init1(IN_NONBLOCK);
+	if (inotify_fd >= 0) {
+		inotify_add_watch(inotify_fd, "/var/lib/pacman/local/",
+						  IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
+	}
+
 	signal(SIGTERM, exit);
 	signal(SIGINT, exit);
 
 	event_loop();
+
+	if (inotify_fd >= 0)
+		close(inotify_fd);
 
 	if (ipc_fd >= 0)
 		close(ipc_fd);
