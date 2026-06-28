@@ -71,7 +71,12 @@ static void truncate_utf8_string(char *dest, const char *src, size_t dest_size,
 			chars++;
 			last_valid_len = i + 1;
 			if (chars == max_chars && src[i + 1] != '\0') {
-				strcpy(dest + last_valid_len, "...");
+				if (last_valid_len + 3 < dest_size) {
+					memcpy(dest + last_valid_len, "...", 3);
+					dest[last_valid_len + 3] = '\0';
+				} else {
+					dest[last_valid_len] = '\0';
+				}
 				return;
 			}
 		}
@@ -103,7 +108,7 @@ typedef struct {
 	uint32_t atags;
 	char layout[32];
 	char title[256];
-	char appid[128];
+
 	char keymode[32];
 	char kb_layout[16];
 	int cpu_pct, mem_pct;
@@ -113,6 +118,12 @@ typedef struct {
 	char time_str[16];
 	bool redraw;
 	bool overview_mode; // 当 active_tags == [0] 时为 true
+	/* cached pixman images (reused while size unchanged) */
+	pixman_image_t *cached_final;
+	pixman_image_t *cached_fg;
+	pixman_image_t *cached_fg_mask;
+	pixman_image_t *cached_bg;
+	uint32_t cached_w, cached_h;
 	struct wl_list link;
 } Bar;
 
@@ -158,7 +169,6 @@ static time_t volume_last_check = 0;
 /* 颜色变量 */
 static pixman_color_t active_fg, active_bg;
 static pixman_color_t occupied_fg, occupied_bg;
-static pixman_color_t inactive_fg, inactive_bg;
 static pixman_color_t urgent_fg, urgent_bg;
 static pixman_color_t empty_fg, empty_bg;
 static pixman_color_t middle_bg, middle_bg_sel;
@@ -283,15 +293,33 @@ static void draw_bar(Bar *bar) {
 
 	pixman_image_t *final = pixman_image_create_bits(
 		PIXMAN_a8r8g8b8, bar->width, bar->height, data, bar->width * 4);
-	pixman_image_t *fg = pixman_image_create_bits(
-		PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
-	pixman_image_t *fg_mask = pixman_image_create_bits(
-		PIXMAN_a8, bar->width, bar->height, NULL, bar->width * 4);
-	pixman_image_t *bg = pixman_image_create_bits(
-		PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
+	/* cache fg/fg_mask/bg across redraws (internal alloc, no data backing) */
+	if (bar->width != bar->cached_w || bar->height != bar->cached_h) {
+		if (bar->cached_fg) pixman_image_unref(bar->cached_fg);
+		if (bar->cached_fg_mask) pixman_image_unref(bar->cached_fg_mask);
+		if (bar->cached_bg) pixman_image_unref(bar->cached_bg);
+		int mask_stride = (bar->width + 3) & ~3;
+		bar->cached_fg = pixman_image_create_bits(
+			PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
+		bar->cached_fg_mask = pixman_image_create_bits(
+			PIXMAN_a8, bar->width, bar->height, NULL, mask_stride);
+		bar->cached_bg = pixman_image_create_bits(
+			PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
+		bar->cached_w = bar->width;
+		bar->cached_h = bar->height;
+	}
+	pixman_image_t *fg = bar->cached_fg;
+	pixman_image_t *fg_mask = bar->cached_fg_mask;
+	pixman_image_t *bg = bar->cached_bg;
 
 	pixman_image_fill_rectangles(
 		PIXMAN_OP_SRC, bg, bar->sel ? &middle_bg_sel : &middle_bg, 1,
+		&(pixman_rectangle16_t){0, 0, bar->width, bar->height});
+	/* clear fg and fg_mask for reuse */
+	pixman_color_t transparent = {0, 0, 0, 0};
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, fg, &transparent, 1,
+		&(pixman_rectangle16_t){0, 0, bar->width, bar->height});
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, fg_mask, &transparent, 1,
 		&(pixman_rectangle16_t){0, 0, bar->width, bar->height});
 
 	uint32_t x = 0;
@@ -340,79 +368,68 @@ static void draw_bar(Bar *bar) {
 		}
 	}
 
-	/* --- 右侧模块列表构建 --- */
+	/* --- 右侧模块列表构建（预计算宽度） --- */
 	struct {
 		const char *text;
 		pixman_color_t *fg;
 		pixman_color_t *bg;
-		bool enabled;
+		uint32_t width;
 	} modules[8];
 	int mod_count = 0;
 
 	char mod_text[8][64];
-	int idx = 0;
 
-	if (show_keymode) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->keymode);
-		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], &keymode_fg,
-											  &keymode_bg, true};
-	}
-	if (show_keyboardlayout) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->kb_layout);
-		modules[idx++] = (typeof(modules[0])){
-			mod_text[idx - 1], &keyboardlayout_fg, &keyboardlayout_bg, true};
-	}
+#define ADD_MODULE(txt, f, b) do { \
+	snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "%s", txt); \
+	modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], f, b, text_width(mod_text[mod_count])}; \
+	mod_count++; \
+} while(0)
+
+	if (show_keymode)
+		ADD_MODULE(bar->keymode, &keymode_fg, &keymode_bg);
+	if (show_keyboardlayout)
+		ADD_MODULE(bar->kb_layout, &keyboardlayout_fg, &keyboardlayout_bg);
 	if (show_cpu) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "CPU:%d%%",
-				 bar->cpu_pct);
-		modules[idx++] =
-			(typeof(modules[0])){mod_text[idx - 1], &cpu_fg, &cpu_bg, true};
+		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "CPU:%d%%", bar->cpu_pct);
+		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &cpu_fg, &cpu_bg, text_width(mod_text[mod_count])};
+		mod_count++;
 	}
 	if (show_mem) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "MEM:%d%%",
-				 bar->mem_pct);
-		modules[idx++] =
-			(typeof(modules[0])){mod_text[idx - 1], &mem_fg, &mem_bg, true};
+		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "MEM:%d%%", bar->mem_pct);
+		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &mem_fg, &mem_bg, text_width(mod_text[mod_count])};
+		mod_count++;
 	}
-	if (show_layout) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->layout);
-		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], &layout_fg,
-											  &layout_bg, true};
-	}
+	if (show_layout)
+		ADD_MODULE(bar->layout, &layout_fg, &layout_bg);
 	if (show_volume) {
 		pixman_color_t *vf = &volume_fg, *vb = &volume_bg;
 		if (bar->volume_muted) {
-			snprintf(mod_text[idx], sizeof(mod_text[idx]), "MUTE");
+			snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "MUTE");
 			vf = &volume_muted_fg;
 			vb = &volume_muted_bg;
 		} else {
-			snprintf(mod_text[idx], sizeof(mod_text[idx]), "VOL:%d",
-					 bar->volume_pct);
+			snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "VOL:%d", bar->volume_pct);
 		}
-		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], vf, vb, true};
+		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], vf, vb, text_width(mod_text[mod_count])};
+		mod_count++;
 	}
 	if (show_pacman) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "UPDATES:%d",
-				 bar->pacman_updates);
-		modules[idx++] = (typeof(modules[0])){mod_text[idx - 1], &pacman_fg,
-											  &pacman_bg, true};
+		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "UPDATES:%d", bar->pacman_updates);
+		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &pacman_fg, &pacman_bg, text_width(mod_text[mod_count])};
+		mod_count++;
 	}
-	if (show_clock) {
-		snprintf(mod_text[idx], sizeof(mod_text[idx]), "%s", bar->time_str);
-		modules[idx++] =
-			(typeof(modules[0])){mod_text[idx - 1], &clock_fg, &clock_bg, true};
-	}
-	mod_count = idx;
+	if (show_clock)
+		ADD_MODULE(bar->time_str, &clock_fg, &clock_bg);
 
 	/* 计算右侧总宽度（含分隔符） */
-	uint32_t sep_w = text_width(separator_str);
+	static uint32_t sep_w = 0;
+	if (sep_w == 0)
+		sep_w = text_width(separator_str);
 	uint32_t right_total_w = 0;
 	for (int i = 0; i < mod_count; i++) {
-		if (modules[i].enabled) {
-			right_total_w += text_width(modules[i].text);
-			if (i != 0)
-				right_total_w += sep_w;
-		}
+		right_total_w += modules[i].width;
+		if (i != 0)
+			right_total_w += sep_w;
 	}
 
 	uint32_t right_start = bar->width - 8 - right_total_w;
@@ -438,8 +455,6 @@ static void draw_bar(Bar *bar) {
 	/* 绘制右侧模块 */
 	uint32_t cur_x = right_start;
 	for (int i = 0; i < mod_count; i++) {
-		if (!modules[i].enabled)
-			continue;
 		if (i != 0) {
 			cur_x = draw_text(separator_str, cur_x, y, fg, fg_mask, bg,
 							  &separator_fg, &separator_bg, bar->width,
@@ -464,9 +479,6 @@ static void draw_bar(Bar *bar) {
 	pixman_image_composite32(PIXMAN_OP_OVER, fg, fg_mask, final, 0, 0, 0, 0, 0,
 							 0, bar->width, bar->height);
 
-	pixman_image_unref(fg);
-	pixman_image_unref(fg_mask);
-	pixman_image_unref(bg);
 	pixman_image_unref(final);
 	munmap(data, bar->bufsize);
 
@@ -630,15 +642,11 @@ static void update_bar_json(Bar *bar, cJSON *json) {
 	cJSON *client = cJSON_GetObjectItem(json, "active_client");
 	if (client && !cJSON_IsNull(client)) {
 		cJSON *t = cJSON_GetObjectItem(client, "title");
-		cJSON *a = cJSON_GetObjectItem(client, "appid");
 		const char *title_str = (t && cJSON_IsString(t)) ? t->valuestring : "";
-		const char *appid_str = (a && cJSON_IsString(a)) ? a->valuestring : "";
 		truncate_utf8_string(bar->title, title_str, sizeof(bar->title),
 							 max_title_len);
-		snprintf(bar->appid, sizeof(bar->appid), "%s", appid_str);
 	} else {
 		bar->title[0] = '\0';
-		bar->appid[0] = '\0';
 	}
 
 	cJSON *tags = cJSON_GetObjectItem(json, "tags");
@@ -692,6 +700,19 @@ static void update_bar_json(Bar *bar, cJSON *json) {
 	bar->redraw = true;
 }
 
+static void apply_keymode_kblayout(cJSON *km, cJSON *kl) {
+	Bar *b;
+	wl_list_for_each(b, &bar_list, link) {
+		if (km)
+			strncpy(b->keymode, km->valuestring,
+					sizeof(b->keymode) - 1);
+		if (kl)
+			strncpy(b->kb_layout, kl->valuestring,
+					sizeof(b->kb_layout) - 1);
+		b->redraw = true;
+	}
+}
+
 static void process_ipc_msg(const char *msg) {
 	cJSON *json = cJSON_Parse(msg);
 	if (!json)
@@ -707,18 +728,9 @@ static void process_ipc_msg(const char *msg) {
 				if (bar)
 					update_bar_json(bar, monitor);
 			}
-			cJSON *km = cJSON_GetObjectItem(monitor, "keymode");
-			cJSON *kl = cJSON_GetObjectItem(monitor, "keyboardlayout");
-			Bar *b;
-			wl_list_for_each(b, &bar_list, link) {
-				if (km)
-					strncpy(b->keymode, km->valuestring,
-							sizeof(b->keymode) - 1);
-				if (kl)
-					strncpy(b->kb_layout, kl->valuestring,
-							sizeof(b->kb_layout) - 1);
-				b->redraw = true;
-			}
+			apply_keymode_kblayout(
+				cJSON_GetObjectItem(monitor, "keymode"),
+				cJSON_GetObjectItem(monitor, "keyboardlayout"));
 		}
 	} else {
 		cJSON *name = cJSON_GetObjectItem(json, "name");
@@ -727,20 +739,9 @@ static void process_ipc_msg(const char *msg) {
 			if (bar)
 				update_bar_json(bar, json);
 		}
-		cJSON *km = cJSON_GetObjectItem(json, "keymode");
-		cJSON *kl = cJSON_GetObjectItem(json, "keyboardlayout");
-		if (km || kl) {
-			Bar *b;
-			wl_list_for_each(b, &bar_list, link) {
-				if (km)
-					strncpy(b->keymode, km->valuestring,
-							sizeof(b->keymode) - 1);
-				if (kl)
-					strncpy(b->kb_layout, kl->valuestring,
-							sizeof(b->kb_layout) - 1);
-				b->redraw = true;
-			}
-		}
+		apply_keymode_kblayout(
+				cJSON_GetObjectItem(json, "keymode"),
+				cJSON_GetObjectItem(json, "keyboardlayout"));
 	}
 	cJSON_Delete(json);
 }
@@ -776,6 +777,9 @@ static void ipc_connect() {
 
 static int cpu_prev_total, cpu_prev_idle;
 static void update_system_info() {
+	int cpu_pct = 0, mem_pct = 0, volume_val = 0;
+	bool volume_muted_val = false, volume_updated = false;
+	char time_str[16] = "";
 	FILE *f = fopen("/proc/stat", "r");
 	if (f) {
 		char cpu[8];
@@ -792,8 +796,7 @@ static void update_system_info() {
 			}
 			cpu_prev_total = total;
 			cpu_prev_idle = idle;
-			Bar *b;
-			wl_list_for_each(b, &bar_list, link) b->cpu_pct = pct;
+			cpu_pct = pct;
 		}
 		fclose(f);
 	}
@@ -808,16 +811,11 @@ static void update_system_info() {
 				sscanf(line + 13, "%ld", &avail);
 		}
 		fclose(f);
-		int pct = total ? (int)(100 - (avail * 100 / total)) : 0;
-		Bar *b;
-		wl_list_for_each(b, &bar_list, link) b->mem_pct = pct;
+		mem_pct = total ? (int)(100 - (avail * 100 / total)) : 0;
 	}
 	time_t now = time(NULL);
 	struct tm *tm = localtime(&now);
-	char ts[16];
-	strftime(ts, sizeof(ts), "%I:%M%p", tm);
-	Bar *b;
-	wl_list_for_each(b, &bar_list, link) strcpy(b->time_str, ts);
+	strftime(time_str, sizeof(time_str), "%I:%M%p", tm);
 
 	/* Volume -- only when dirty or 60s safety interval */
 	{
@@ -825,27 +823,23 @@ static void update_system_info() {
 		if (volume_dirty || now_sec - volume_last_check >= 60) {
 			volume_dirty = false;
 			volume_last_check = now_sec;
+			volume_updated = true;
 
-			int vol = -1;
-			bool muted = false;
+			volume_val = -1;
+			volume_muted_val = false;
 			FILE *fp = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
 			if (fp) {
 				char line[256];
 				if (fgets(line, sizeof(line), fp)) {
 					float vol_float;
 					if (sscanf(line, "Volume: %f", &vol_float) == 1)
-						vol = (int)(vol_float * 100 + 0.5f);
+						volume_val = (int)(vol_float * 100 + 0.5f);
 					if (strstr(line, "[MUTED]"))
-						muted = true;
+						volume_muted_val = true;
 				}
 				pclose(fp);
 			}
-			if (vol < 0) vol = 0;
-			Bar *b;
-			wl_list_for_each(b, &bar_list, link) {
-				b->volume_pct = vol;
-				b->volume_muted = muted;
-			}
+			if (volume_val < 0) volume_val = 0;
 		}
 	}
 
@@ -879,8 +873,21 @@ static void update_system_info() {
 
 			pkg_cached = (official > 0 ? official : 0) + (aur > 0 ? aur : 0);
 		}
+	}
+
+	/* single bar iteration to apply all values */
+	{
 		Bar *b;
-		wl_list_for_each(b, &bar_list, link) b->pacman_updates = pkg_cached;
+		wl_list_for_each(b, &bar_list, link) {
+			b->cpu_pct = cpu_pct;
+			b->mem_pct = mem_pct;
+			strcpy(b->time_str, time_str);
+			if (volume_updated) {
+				b->volume_pct = volume_val;
+				b->volume_muted = volume_muted_val;
+			}
+			b->pacman_updates = pkg_cached;
+		}
 	}
 }
 
@@ -1007,8 +1014,6 @@ static void init_colors() {
 	hex_to_pixman(active_bg_color_hex, &active_bg);
 	hex_to_pixman(occupied_fg_color_hex, &occupied_fg);
 	hex_to_pixman(occupied_bg_color_hex, &occupied_bg);
-	hex_to_pixman(inactive_fg_color_hex, &inactive_fg);
-	hex_to_pixman(inactive_bg_color_hex, &inactive_bg);
 	hex_to_pixman(urgent_fg_color_hex, &urgent_fg);
 	hex_to_pixman(urgent_bg_color_hex, &urgent_bg);
 	hex_to_pixman(empty_fg_color_hex, &empty_fg);

@@ -51,8 +51,6 @@ static const char *tag_names_urgent[TAG_COUNT] = {
 #define active_bg_color_hex     0X262624FF
 #define occupied_fg_color_hex   0XE8E4DCFF
 #define occupied_bg_color_hex   0X262624FF
-#define inactive_fg_color_hex   0X5A5955FF
-#define inactive_bg_color_hex   0X262624FF
 #define urgent_fg_color_hex     0XC67777FF
 #define urgent_bg_color_hex     0X262624FF
 #define empty_fg_color_hex      0X5A5955FF
