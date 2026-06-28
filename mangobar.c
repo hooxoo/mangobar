@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/inotify.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -148,6 +149,11 @@ static int inotify_fd = -1;
 static bool pkg_dirty = false;
 static time_t pkg_last_check = 0;
 static int pkg_cached = 0;
+
+static int pactl_fd = -1;
+static pid_t pactl_pid = 0;
+static bool volume_dirty = true;
+static time_t volume_last_check = 0;
 
 /* 颜色变量 */
 static pixman_color_t active_fg, active_bg;
@@ -813,34 +819,40 @@ static void update_system_info() {
 	Bar *b;
 	wl_list_for_each(b, &bar_list, link) strcpy(b->time_str, ts);
 
-	/* Volume */
+	/* Volume -- only when dirty or 60s safety interval */
 	{
-		int vol = -1;
-		bool muted = false;
-		FILE *fp = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
-		if (fp) {
-			char line[256];
-			if (fgets(line, sizeof(line), fp)) {
-				float vol_float;
-				if (sscanf(line, "Volume: %f", &vol_float) == 1)
-					vol = (int)(vol_float * 100 + 0.5f);
-				if (strstr(line, "[MUTED]"))
-					muted = true;
+		time_t now_sec = time(NULL);
+		if (volume_dirty || now_sec - volume_last_check >= 60) {
+			volume_dirty = false;
+			volume_last_check = now_sec;
+
+			int vol = -1;
+			bool muted = false;
+			FILE *fp = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+			if (fp) {
+				char line[256];
+				if (fgets(line, sizeof(line), fp)) {
+					float vol_float;
+					if (sscanf(line, "Volume: %f", &vol_float) == 1)
+						vol = (int)(vol_float * 100 + 0.5f);
+					if (strstr(line, "[MUTED]"))
+						muted = true;
+				}
+				pclose(fp);
 			}
-			pclose(fp);
-		}
-		if (vol < 0) vol = 0;
-		Bar *b;
-		wl_list_for_each(b, &bar_list, link) {
-			b->volume_pct = vol;
-			b->volume_muted = muted;
+			if (vol < 0) vol = 0;
+			Bar *b;
+			wl_list_for_each(b, &bar_list, link) {
+				b->volume_pct = vol;
+				b->volume_muted = muted;
+			}
 		}
 	}
 
-	/* Updates (check every 3600s, or immediately when pkg_dirty) */
+	/* Updates (check every 3600s) */
 	{
 		time_t now_sec = time(NULL);
-		if (pkg_dirty || now_sec - pkg_last_check >= 3600) {
+		if (now_sec - pkg_last_check >= 3600) {
 			pkg_dirty = false;
 			pkg_last_check = now_sec;
 
@@ -872,6 +884,44 @@ static void update_system_info() {
 	}
 }
 
+static void spawn_pactl_subscribe() {
+	int pipefd[2];
+	if (pipe2(pipefd, O_CLOEXEC) < 0)
+		return;
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return;
+	}
+
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		execlp("pactl", "pactl", "subscribe", NULL);
+		_exit(127);
+	}
+
+	close(pipefd[1]);
+	pactl_fd = pipefd[0];
+	pactl_pid = pid;
+	fcntl(pactl_fd, F_SETFL, fcntl(pactl_fd, F_GETFL) | O_NONBLOCK);
+}
+
+static void cleanup_pactl() {
+	if (pactl_fd >= 0) {
+		close(pactl_fd);
+		pactl_fd = -1;
+	}
+	if (pactl_pid > 0) {
+		kill(pactl_pid, SIGTERM);
+		waitpid(pactl_pid, NULL, 0);
+		pactl_pid = 0;
+	}
+}
+
 static void event_loop() {
 	int wl_fd = wl_display_get_fd(display);
 	while (running) {
@@ -882,9 +932,12 @@ static void event_loop() {
 			FD_SET(ipc_fd, &rfds);
 		if (inotify_fd >= 0)
 			FD_SET(inotify_fd, &rfds);
+		if (pactl_fd >= 0)
+			FD_SET(pactl_fd, &rfds);
 		int maxfd = wl_fd;
 		if (ipc_fd > maxfd) maxfd = ipc_fd;
 		if (inotify_fd > maxfd) maxfd = inotify_fd;
+		if (pactl_fd > maxfd) maxfd = pactl_fd;
 		struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
 		wl_display_flush(display);
 
@@ -912,7 +965,24 @@ static void event_loop() {
 		if (inotify_fd >= 0 && FD_ISSET(inotify_fd, &rfds)) {
 			char ev_buf[4096];
 			read(inotify_fd, ev_buf, sizeof(ev_buf));
+			pkg_cached = 0;
 			pkg_dirty = true;
+		}
+		if (pactl_fd >= 0 && FD_ISSET(pactl_fd, &rfds)) {
+			char buf[4096];
+			ssize_t n = read(pactl_fd, buf, sizeof(buf) - 1);
+			if (n > 0) {
+				buf[n] = '\0';
+				if (strstr(buf, "sink"))
+					volume_dirty = true;
+			} else {
+				close(pactl_fd);
+				pactl_fd = -1;
+				if (pactl_pid > 0) {
+					waitpid(pactl_pid, NULL, WNOHANG);
+					pactl_pid = 0;
+				}
+			}
 		}
 		static time_t last_sec;
 		time_t sec = time(NULL);
@@ -1024,10 +1094,14 @@ int main() {
 						  IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
 	}
 
+	spawn_pactl_subscribe();
+
 	signal(SIGTERM, exit);
 	signal(SIGINT, exit);
 
 	event_loop();
+
+	cleanup_pactl();
 
 	if (inotify_fd >= 0)
 		close(inotify_fd);
