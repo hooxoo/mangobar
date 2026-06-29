@@ -21,4 +21,4 @@ so take that into consideration. for me, it works w/o any problems so far.
 - i only use 5 tags and is forked to work with that.
   - edit lines 13~29 in config.def.h file to match your tag count
 - some layout names (layouts I never use) won't be formatted properly.
-  - check line 118 of mangobar.c file and edit it to personal liking.
+  - check line 130 of mangobar.c file and edit it to personal liking.
