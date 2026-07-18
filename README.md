@@ -13,7 +13,7 @@ so take that into consideration. for me, it works w/o any problems so far.
 
 # added features
 - ability to place bar top or bottom of the screen
-- pacman (pending updates) and volume module (via wpctl)
+- pacman (pending updates) ~~and volume module (via wpctl)~~
 - customize tag colors depending on state (occupied/active/urgent)
 - layout name module moved to right side
 
