@@ -1,31 +1,35 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-static const char *fontstr = "IoskeleyMono Nerd Font:style=Regular:size=15";
-// static const char *fontstr = "JetBrainsMono NFP:size=14:fontfeatures=ss02=1:fontfeatures=zero=1";
-static const int bar_height = 30;
+static const char *fontstr = "JetBrainsMono NFP:size=14:fontfeatures=ss02=1:fontfeatures=zero=1";
+// static const char *fontstr = "IoskeleyMono Nerd Font:style=Medium:size=15";
+// static const char *fontstr = "Sarasa Mono K:style=SemiBold:size=17";
+static const int bar_height = 34;
 static const int buffer_scale = 1;
 static const int max_title_len = 100;
 
 /* bar position: 0 = top, 1 = bottom */
-#define BAR_POSITION 0
+#define BAR_POSITION 1
 
 #define TAG_COUNT 5
 static const char *tag_names[TAG_COUNT] = {
-    // " 󱘹 ", " 󱘹 ", " 󱘹 ", " 󱘹 ", " 󱘹 "
-    " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
+    " 󱘹 ", " 󱘹 ", " 󱘹 ", " 󱘹 ", " 󱘹 "
+    // "  ", "  ", "  ", "  ", "  "
+    // " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
 };
 static const char *tag_names_occupied[TAG_COUNT] = {
-    // " 󱇬 ", " 󱇬 ", " 󱇬 ", " 󱇬 ", " 󱇬 "
-    " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
+    " 󱇬 ", " 󱇬 ", " 󱇬 ", " 󱇬 ", " 󱇬 "
+    // " 󰊠 ", " 󰊠 ", " 󰊠 ", " 󰊠 ", " 󰊠 "
+    // " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
 };
 static const char *tag_names_active[TAG_COUNT] = {
-    // "  ", "  ", "  ", "  ", "  "
-    " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
+    "  ", "  ", "  ", "  ", "  "
+    // " 󰮯 ", " 󰮯 ", " 󰮯 ", " 󰮯 ", " 󰮯 "
+    // " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
 };
 static const char *tag_names_urgent[TAG_COUNT] = {
-    // " 󱈸 ", " 󱈸 ", " 󱈸 ", " 󱈸 ", " 󱈸 "
-    " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
+    " 󱈸 ", " 󱈸 ", " 󱈸 ", " 󱈸 ", " 󱈸 "
+    // " 1:WEB ", " 2:CODE ", " 3:MUSIC ", " 4:MISC ", " 5:CHAT "
 };
 
 /* enable module */
@@ -37,7 +41,6 @@ static const char *tag_names_urgent[TAG_COUNT] = {
 #define show_clock           1
 #define show_keymode         0
 #define show_keyboardlayout  0
-#define show_volume           0
 #define show_pacman           1
 
 /* show only occupied tags */
@@ -74,11 +77,7 @@ static const char *tag_names_urgent[TAG_COUNT] = {
 #define keymode_fg_color_hex    0XC68A93FF
 #define keymode_bg_color_hex    0X262624FF
 #define keyboardlayout_fg_color_hex 0XC68A93FF
-#define keyboardlayout_bg_color_hex 0X262624FF
-#define volume_fg_color_hex        0XE8E4DCFF
-#define volume_bg_color_hex        0X262624FF
-#define volume_muted_fg_color_hex  0XC67777FF
-#define volume_muted_bg_color_hex  0X262624FF
+#define keyboardlayout_bg_color_hex 0XC68A93FF
 #define pacman_fg_color_hex        0XE8E4DCFF
 #define pacman_bg_color_hex        0X262624FF
 

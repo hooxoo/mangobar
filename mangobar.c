@@ -111,9 +111,6 @@ typedef struct {
 
 	char keymode[32];
 	char kb_layout[16];
-	int cpu_pct, mem_pct;
-	int volume_pct;
-	bool volume_muted;
 	int pacman_updates;
 	char time_str[16];
 	bool redraw;
@@ -129,17 +126,17 @@ typedef struct {
 
 /* rename layout name */
 static const char *layout_name(const char *symbol) {
-  if (strcmp(symbol, "T") == 0) return " LAYOUT:TILE";
-  if (strcmp(symbol, "M") == 0) return " LAYOUT:MONOCLE";
-  if (strcmp(symbol, "F") == 0) return " LAYOUT:FAIR";
-  if (strcmp(symbol, "S") == 0) return " LAYOUT:SCROLLER";
-  if (strcmp(symbol, "G") == 0) return " LAYOUT:GRID";
-  if (strcmp(symbol, "CT") == 0) return " LAYOUT:cTILE";
-  if (strcmp(symbol, "VT") == 0) return " LAYOUT:vTILE";
-  if (strcmp(symbol, "VF") == 0) return " LAYOUT:vFAIR";
-  if (strcmp(symbol, "DW") == 0) return " LAYOUT:DWINDLE";
-  if (strcmp(symbol, "VS") == 0) return " LAYOUT:vSCROLLER";
-  if (strcmp(symbol, "VK") == 0) return " LAYOUT:FREE";
+  if (strcmp(symbol, "T") == 0) return " 󰙀 Tile";
+  if (strcmp(symbol, "M") == 0) return " 󰙀 Monocle";
+  if (strcmp(symbol, "F") == 0) return " 󰙀 Fair";
+  if (strcmp(symbol, "S") == 0) return " 󰙀 Scroller";
+  if (strcmp(symbol, "G") == 0) return " 󰙀 Grid";
+  if (strcmp(symbol, "CT") == 0) return " 󰙀 Ctile";
+  if (strcmp(symbol, "VT") == 0) return " 󰙀 Vtile";
+  if (strcmp(symbol, "VF") == 0) return " 󰙀 Vfair";
+  if (strcmp(symbol, "DW") == 0) return " 󰙀 Dwindle";
+  if (strcmp(symbol, "VS") == 0) return " 󰙀 Vscroller";
+  if (strcmp(symbol, "VK") == 0) return " 󰙀 Free";
   return symbol;
 }
 
@@ -161,11 +158,6 @@ static bool pkg_dirty = false;
 static time_t pkg_last_check = 0;
 static int pkg_cached = 0;
 
-static int pactl_fd = -1;
-static pid_t pactl_pid = 0;
-static bool volume_dirty = true;
-static time_t volume_last_check = 0;
-
 /* 颜色变量 */
 static pixman_color_t active_fg, active_bg;
 static pixman_color_t occupied_fg, occupied_bg;
@@ -180,8 +172,6 @@ static pixman_color_t mem_fg, mem_bg;
 static pixman_color_t clock_fg, clock_bg;
 static pixman_color_t keymode_fg, keymode_bg;
 static pixman_color_t keyboardlayout_fg, keyboardlayout_bg;
-static pixman_color_t volume_fg, volume_bg;
-static pixman_color_t volume_muted_fg, volume_muted_bg;
 static pixman_color_t pacman_fg, pacman_bg;
 static pixman_color_t overview_fg, overview_bg;
 static pixman_color_t separator_fg, separator_bg;
@@ -389,32 +379,10 @@ static void draw_bar(Bar *bar) {
 		ADD_MODULE(bar->keymode, &keymode_fg, &keymode_bg);
 	if (show_keyboardlayout)
 		ADD_MODULE(bar->kb_layout, &keyboardlayout_fg, &keyboardlayout_bg);
-	if (show_cpu) {
-		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "CPU:%d%%", bar->cpu_pct);
-		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &cpu_fg, &cpu_bg, text_width(mod_text[mod_count])};
-		mod_count++;
-	}
-	if (show_mem) {
-		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "MEM:%d%%", bar->mem_pct);
-		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &mem_fg, &mem_bg, text_width(mod_text[mod_count])};
-		mod_count++;
-	}
 	if (show_layout)
 		ADD_MODULE(bar->layout, &layout_fg, &layout_bg);
-	if (show_volume) {
-		pixman_color_t *vf = &volume_fg, *vb = &volume_bg;
-		if (bar->volume_muted) {
-			snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "MUTE");
-			vf = &volume_muted_fg;
-			vb = &volume_muted_bg;
-		} else {
-			snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "VOL:%d", bar->volume_pct);
-		}
-		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], vf, vb, text_width(mod_text[mod_count])};
-		mod_count++;
-	}
 	if (show_pacman) {
-		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "UPDATES:%d", bar->pacman_updates);
+		snprintf(mod_text[mod_count], sizeof(mod_text[mod_count]), "󰮯 %d", bar->pacman_updates);
 		modules[mod_count] = (typeof(modules[0])){mod_text[mod_count], &pacman_fg, &pacman_bg, text_width(mod_text[mod_count])};
 		mod_count++;
 	}
@@ -641,7 +609,7 @@ static void update_bar_json(Bar *bar, cJSON *json) {
 
 	cJSON *client = cJSON_GetObjectItem(json, "active_client");
 	if (client && !cJSON_IsNull(client)) {
-		cJSON *t = cJSON_GetObjectItem(client, "title");
+		cJSON *t = cJSON_GetObjectItem(client, "appid");
 		const char *title_str = (t && cJSON_IsString(t)) ? t->valuestring : "";
 		truncate_utf8_string(bar->title, title_str, sizeof(bar->title),
 							 max_title_len);
@@ -775,73 +743,11 @@ static void ipc_connect() {
 	fcntl(ipc_fd, F_SETFL, fcntl(ipc_fd, F_GETFL) | O_NONBLOCK);
 }
 
-static int cpu_prev_total, cpu_prev_idle;
 static void update_system_info() {
-	int cpu_pct = 0, mem_pct = 0, volume_val = 0;
-	bool volume_muted_val = false, volume_updated = false;
 	char time_str[16] = "";
-	FILE *f = fopen("/proc/stat", "r");
-	if (f) {
-		char cpu[8];
-		int user, nice, system, idle;
-		if (fscanf(f, "%s %d %d %d %d", cpu, &user, &nice, &system, &idle) ==
-			5) {
-			int total = user + nice + system + idle;
-			int pct = 0;
-			if (cpu_prev_total) {
-				int total_d = total - cpu_prev_total;
-				int idle_d = idle - cpu_prev_idle;
-				if (total_d)
-					pct = 100 * (total_d - idle_d) / total_d;
-			}
-			cpu_prev_total = total;
-			cpu_prev_idle = idle;
-			cpu_pct = pct;
-		}
-		fclose(f);
-	}
-	f = fopen("/proc/meminfo", "r");
-	if (f) {
-		long total = 0, avail = 0;
-		char line[128];
-		while (fgets(line, sizeof(line), f)) {
-			if (strncmp(line, "MemTotal:", 9) == 0)
-				sscanf(line + 9, "%ld", &total);
-			else if (strncmp(line, "MemAvailable:", 13) == 0)
-				sscanf(line + 13, "%ld", &avail);
-		}
-		fclose(f);
-		mem_pct = total ? (int)(100 - (avail * 100 / total)) : 0;
-	}
 	time_t now = time(NULL);
 	struct tm *tm = localtime(&now);
-	strftime(time_str, sizeof(time_str), "%I:%M%p", tm);
-
-	/* Volume -- only when dirty or 60s safety interval */
-	{
-		time_t now_sec = time(NULL);
-		if (volume_dirty || now_sec - volume_last_check >= 60) {
-			volume_dirty = false;
-			volume_last_check = now_sec;
-			volume_updated = true;
-
-			volume_val = -1;
-			volume_muted_val = false;
-			FILE *fp = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
-			if (fp) {
-				char line[256];
-				if (fgets(line, sizeof(line), fp)) {
-					float vol_float;
-					if (sscanf(line, "Volume: %f", &vol_float) == 1)
-						volume_val = (int)(vol_float * 100 + 0.5f);
-					if (strstr(line, "[MUTED]"))
-						volume_muted_val = true;
-				}
-				pclose(fp);
-			}
-			if (volume_val < 0) volume_val = 0;
-		}
-	}
+	strftime(time_str, sizeof(time_str), "󰥔 %R", tm);
 
 	/* Updates (check every 3600s) */
 	{
@@ -879,53 +785,9 @@ static void update_system_info() {
 	{
 		Bar *b;
 		wl_list_for_each(b, &bar_list, link) {
-			b->cpu_pct = cpu_pct;
-			b->mem_pct = mem_pct;
 			strcpy(b->time_str, time_str);
-			if (volume_updated) {
-				b->volume_pct = volume_val;
-				b->volume_muted = volume_muted_val;
-			}
 			b->pacman_updates = pkg_cached;
 		}
-	}
-}
-
-static void spawn_pactl_subscribe() {
-	int pipefd[2];
-	if (pipe2(pipefd, O_CLOEXEC) < 0)
-		return;
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return;
-	}
-
-	if (pid == 0) {
-		close(pipefd[0]);
-		dup2(pipefd[1], STDOUT_FILENO);
-		close(pipefd[1]);
-		execlp("pactl", "pactl", "subscribe", NULL);
-		_exit(127);
-	}
-
-	close(pipefd[1]);
-	pactl_fd = pipefd[0];
-	pactl_pid = pid;
-	fcntl(pactl_fd, F_SETFL, fcntl(pactl_fd, F_GETFL) | O_NONBLOCK);
-}
-
-static void cleanup_pactl() {
-	if (pactl_fd >= 0) {
-		close(pactl_fd);
-		pactl_fd = -1;
-	}
-	if (pactl_pid > 0) {
-		kill(pactl_pid, SIGTERM);
-		waitpid(pactl_pid, NULL, 0);
-		pactl_pid = 0;
 	}
 }
 
@@ -939,12 +801,9 @@ static void event_loop() {
 			FD_SET(ipc_fd, &rfds);
 		if (inotify_fd >= 0)
 			FD_SET(inotify_fd, &rfds);
-		if (pactl_fd >= 0)
-			FD_SET(pactl_fd, &rfds);
 		int maxfd = wl_fd;
 		if (ipc_fd > maxfd) maxfd = ipc_fd;
 		if (inotify_fd > maxfd) maxfd = inotify_fd;
-		if (pactl_fd > maxfd) maxfd = pactl_fd;
 		struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
 		wl_display_flush(display);
 
@@ -974,22 +833,6 @@ static void event_loop() {
 			read(inotify_fd, ev_buf, sizeof(ev_buf));
 			pkg_cached = 0;
 			pkg_dirty = true;
-		}
-		if (pactl_fd >= 0 && FD_ISSET(pactl_fd, &rfds)) {
-			char buf[4096];
-			ssize_t n = read(pactl_fd, buf, sizeof(buf) - 1);
-			if (n > 0) {
-				buf[n] = '\0';
-				if (strstr(buf, "sink"))
-					volume_dirty = true;
-			} else {
-				close(pactl_fd);
-				pactl_fd = -1;
-				if (pactl_pid > 0) {
-					waitpid(pactl_pid, NULL, WNOHANG);
-					pactl_pid = 0;
-				}
-			}
 		}
 		static time_t last_sec;
 		time_t sec = time(NULL);
@@ -1034,10 +877,6 @@ static void init_colors() {
 	hex_to_pixman(keymode_bg_color_hex, &keymode_bg);
 	hex_to_pixman(keyboardlayout_fg_color_hex, &keyboardlayout_fg);
 	hex_to_pixman(keyboardlayout_bg_color_hex, &keyboardlayout_bg);
-	hex_to_pixman(volume_fg_color_hex, &volume_fg);
-	hex_to_pixman(volume_bg_color_hex, &volume_bg);
-	hex_to_pixman(volume_muted_fg_color_hex, &volume_muted_fg);
-	hex_to_pixman(volume_muted_bg_color_hex, &volume_muted_bg);
 	hex_to_pixman(pacman_fg_color_hex, &pacman_fg);
 	hex_to_pixman(pacman_bg_color_hex, &pacman_bg);
 
@@ -1099,14 +938,10 @@ int main() {
 						  IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
 	}
 
-	spawn_pactl_subscribe();
-
 	signal(SIGTERM, exit);
 	signal(SIGINT, exit);
 
 	event_loop();
-
-	cleanup_pactl();
 
 	if (inotify_fd >= 0)
 		close(inotify_fd);
